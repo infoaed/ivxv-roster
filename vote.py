@@ -7,25 +7,30 @@ import subprocess
 import urllib.parse
 import re
 import getpass
+import hashlib
 import json
 import os
 import base64
 import qrcode
 import argparse
 import io
+import uuid
 from tinyec import registry
 from pyivxv.crypto.keys import PublicKey
 from pyasice import Container
 
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--key", "-k", default="./KOV_2025_pub.asc", 
+ap.add_argument("--key", "-k", default="./DUMMY_pub.pem", 
                 help="Hääletuse avaliku võtme fail")
 ap.add_argument("--message", "-m", default="", help="Valiku kood, tüüpiliselt kujul 0000.000")
 ap.add_argument("--ballot", "-b", default="", help="Balloti fail ehk sedel ise")
 ap.add_argument("--ephemeral", "-e", default="", help="Efemeerse võtme väärtus base64 vormingus")
 ap.add_argument("--pin1", default="", help="Isikutuvastuse PIN1 väärtus, puudumisel küsitakse")
 ap.add_argument("--pin2", default="", help="Allkirjastamise PIN2 väärtus, puudumisel küsitakse(ei tööta)")
+ap.add_argument("--local", "-l", action='store_true', help="Täna serveriga juttu ei tee")
+ap.add_argument("--round", "-r", default='DUMMY', help="Valimiste identifikaator")
+ap.add_argument("--question", "-q", default='DUMMY', help="Küsimuse identifikaator")
 args = ap.parse_args()
 
 #args.ballot = "CIn4xUjgTNlEtlbdlYtzLQ==.ballot"
@@ -33,7 +38,6 @@ args = ap.parse_args()
 
 save_pin1=args.pin1
 ballot_file=args.ballot
-
 
 
 def get_slots_info():
@@ -302,26 +306,28 @@ def main():
         print("PIN1 tokenit ei leitud")
         return
 
-    request_data = {
-        "id": 0.0,
-        "method": "RPC.VoterChoices",
-        "params": [{"OS": "Röster 0.0.1", "AuthMethod": "tls"}]
-    }
-
     cert_file = export_cert_to_pem()  # ekspordib vaikimisi ./temp/cert.pem
-    #print("--- pem file ---")
-    #print(cert_file)
-    print("Alustame sessiooni ja küsime valijate nimekirja")
-    out, err = send_choices_request(request_data, token_label, cert_file)
-    #print("--- STDOUT ---")
-    #print(out)
-    #print("--- STDERR ---")
-    #print(err)
-    choices=parse_choices_response(out)
-    #print(json.dumps(choices, indent=4, ensure_ascii=False))
-    
-    with open("VoterChoices.json", "w", encoding="utf-8") as f:
-        json.dump(choices, f, indent=4, ensure_ascii=False)
+
+    if not args.local:
+        request_data = {
+            "id": 0.0,
+            "method": "RPC.VoterChoices",
+            "params": [{"OS": "Röster 0.0.1", "AuthMethod": "tls"}]
+        }
+
+        #print("--- pem file ---")
+        #print(cert_file)
+        print("Alustame sessiooni ja küsime kandidaatide nimekirja")
+        out, err = send_choices_request(request_data, token_label, cert_file)
+        #print("--- STDOUT ---")
+        #print(out)
+        #print("--- STDERR ---")
+        #print(err)
+        choices=parse_choices_response(out)
+        #print(json.dumps(choices, indent=4, ensure_ascii=False))
+        
+        with open("VoterChoices.json", "w", encoding="utf-8") as f:
+            json.dump(choices, f, indent=4, ensure_ascii=False)
 
     ## read VoterChoice.json
     #with open("./VoterChoices.json", "r") as f:
@@ -339,7 +345,10 @@ def main():
         if args.message:
             message = args.message
         else:
-            group, message, name = pick_choice(choices["result"]["List_"])
+            if args.local:
+                message = input("Sisesta sedeli tekst: ")
+            else:
+                group, message, name = pick_choice(choices["result"]["List_"])
 
         ## make cryptogram
         bin_key = load_pem(args.key)
@@ -357,78 +366,94 @@ def main():
     eph_key_bytes = eph_key.to_bytes(num_bytes, 'big')
     eph_key_str = base64.standard_b64encode(eph_key_bytes).decode('ascii')
 
-   
+    fn_root = f"./{args.round}.question-{args.question}"
 
-    with open("./KOV_2025.question-KOV_2025.ballot", "wb") as f:
+    with open(fn_root+".ballot", "wb") as f:
         f.write(crypt_bin)
-    with open("./KOV_2025.question-KOV_2025.ballot.ephemeral", "w") as f:
+    with open(fn_root+".ballot.ephemeral", "w") as f:
         f.write(str(eph_key))
 
     ## generate asice file
     print("Allkirjasta valik PIN2 abil")
-    asic_file = generate_asice_file(asice_path="./KOV_2025.question-KOV_2025.asice", 
-                                    ballot_path="./KOV_2025.question-KOV_2025.ballot")
+    asic_file = generate_asice_file(asice_path=fn_root+".asice", 
+                                    ballot_path=fn_root+".ballot")
     
     ## get asice file
-    with open("./KOV_2025.question-KOV_2025.asice", "rb") as f:
+    with open(fn_root+".asice", "rb") as f:
         asice_data = f.read()
     vote = base64.b64encode(asice_data).decode("utf-8")
 
-    ## send vote
-    request_data = {
-        "id": choices["id"],
-        "method": "RPC.Vote",
-        "params": [
-            {
-            "OS": "Röster 0.0.1",
-            "AuthMethod": "tls",
-            "Choices": choices["result"]["Choices"],
-            "Type": "bdoc",
-            "SessionID": choices["result"]["SessionID"],
-            "Vote": vote
-            }
-        ]
-    }
+    if not args.local:
 
-    out, err = send_vote_tls_request(request_data, token_label, cert_file)
-    #print("--- STDOUT ---")
-    #print(out)
-    #print("--- STDERR ---")
-    #print(err)
-    vote_data=parse_vote_response(out)
+        ## send vote
+        request_data = {
+            "id": choices["id"],
+            "method": "RPC.Vote",
+            "params": [
+                {
+                "OS": "Röster 0.0.1",
+                "AuthMethod": "tls",
+                "Choices": choices["result"]["Choices"],
+                "Type": "bdoc",
+                "SessionID": choices["result"]["SessionID"],
+                "Vote": vote
+                }
+            ]
+        }
 
-    with open("./KOV_2025.question-KOV_2025.ballot", "rb") as f:
+        out, err = send_vote_tls_request(request_data, token_label, cert_file)
+        #print("--- STDOUT ---")
+        #print(out)
+        #print("--- STDERR ---")
+        #print(err)
+        vote_data=parse_vote_response(out)
+
+    with open(fn_root+".ballot", "rb") as f:
         ballot = f.read()
 
     #get time
     container = Container(io.BytesIO(asice_data))
     for xmlsig in container.iter_signatures():
         BallotMoment = xmlsig.get_signing_time()
+        ocsp = xmlsig.get_ocsp_response().get_encapsulated_response()
+        tsp = xmlsig.get_timestamp_response()
 
-    if vote_data["error"] is not None:
-        print("ERROR:", vote_data["error"])
-        return        
+    if not args.local:
+        if vote_data["error"] is not None:
+            print("ERROR:", vote_data["error"])
+            return        
+
+        voteid = vote_data["result"]["VoteID"]
+        sessid = choices["result"]["SessionID"]
+        choics = choices["result"]["Choices"]
+
+    else:
+
+        voteid = base64.standard_b64encode(hashlib.md5(ballot).digest()).decode('ascii')
+        sessid = base64.standard_b64encode(uuid.uuid4().bytes).decode('ascii')
+        choices = None
+
+    votesafe = voteid.replace("/","_")
 
     json_storage = {
         "BallotMoment": BallotMoment,
         "Ephemeral": eph_key_str,
-        "KOV_2025.question-KOV_2025.ballot":  base64.standard_b64encode(ballot).decode('ascii'), 
-        "VoteID": vote_data["result"]["VoteID"],
+        (fn_root+".ballot").lstrip("./"):  base64.standard_b64encode(ballot).decode('ascii'), 
+        "VoteID": voteid,
         "error": None,
         "id": 1,
         "result": {
-            "Choices": choices["result"]["Choices"],
+            "Choices": choices,
             "Qualification": {
-                "ocsp": vote_data["result"]["Qualification"]["ocsp"],
-                "tspreg": vote_data["result"]["Qualification"]["tspreg"]
+                "ocsp": base64.standard_b64encode(ocsp).decode('ascii'),
+                "tspreg": base64.standard_b64encode(tsp).decode('ascii')
             },
-            "SessionID": choices["result"]["SessionID"],
+            "SessionID": sessid,
             "Type": "bdoc",
             "Vote": vote
         }
     }
 
-    votesafe = vote_data["result"]["VoteID"].replace("/","_")
     # write json
     print(f"{votesafe}.json")
     with open(f"{votesafe}.json", 'w') as outfile:
@@ -440,10 +465,17 @@ def main():
 
     # write qr
     print(f"{votesafe}.png")
-    make_qr(sessid=vote_data["result"]["SessionID"], 
-            ephkey=eph_key_str, 
-            voteid=vote_data["result"]["VoteID"],
-            filename=f"{votesafe}.png")
+    if not args.local:
+        make_qr(sessid=vote_data["result"]["SessionID"], 
+                ephkey=eph_key_str, 
+                voteid=vote_data["result"]["VoteID"],
+                filename=f"{votesafe}.png")
+    else:
+        make_qr(sessid=sessid, 
+                ephkey=eph_key_str, 
+                voteid=voteid,
+                filename=f"{votesafe}.png")
+        
     print("done")
 
 if __name__ == "__main__":
