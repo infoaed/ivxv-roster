@@ -28,7 +28,8 @@ ap.add_argument("--ballot", "-b", default="", help="Balloti fail ehk sedel ise")
 ap.add_argument("--ephemeral", "-e", default="", help="Efemeerse võtme väärtus base64 vormingus")
 ap.add_argument("--pin1", default="", help="Isikutuvastuse PIN1 väärtus, puudumisel küsitakse")
 ap.add_argument("--pin2", default="", help="Allkirjastamise PIN2 väärtus, puudumisel küsitakse(ei tööta)")
-ap.add_argument("--local", "-l", action='store_true', help="Täna serveriga juttu ei tee")
+ap.add_argument("--local", "-l", default=False, action='store_true', help="Täna serveriga juttu ei tee")
+ap.add_argument("--collector", "-c", default=False, action='store_true', help="Ajatemplile kogumisteenuse signatuur")
 ap.add_argument("--round", "-r", default='DUMMY', help="Valimiste identifikaator")
 ap.add_argument("--question", "-q", default='DUMMY', help="Küsimuse identifikaator")
 args = ap.parse_args()
@@ -270,17 +271,20 @@ def load_pem(path: str) -> bytes:
     b64 = "".join(l for l in lines if not l.startswith("-----"))
     return base64.b64decode(b64)
 
-def generate_asice_file(asice_path, ballot_path):
+def generate_asice_file(asice_path, ballot_path, ivxv_collect = False):
     # digidoc-tool command
-    cmd = [
-        "digidoc-tool", "create",
-        "--tsurl=https://eid-dd.ria.ee/ts",
-        f"--file={ballot_path}",
-        asice_path
-    ]
+    cmd = [ ("/usr/local/bin/" if ivxv_collect else "") + "digidoc-tool" ]
+    cmd.append("create")
+    if ivxv_collect: cmd.append("--ivxvkey=ts.pem")
+    cmd.append(f"--file={ballot_path}")
+    cmd.append(asice_path)
 
     print(" ".join(a for a in cmd))
-    result = subprocess.run(cmd, capture_output=True)
+
+    env = os.environ.copy()
+    if ivxv_collect: env["LD_LIBRARY_PATH"] = "/usr/local/lib"
+
+    result = subprocess.run(cmd, env=env, capture_output=True)
     return result.stdout.decode(errors="ignore"), result.stderr.decode(errors="ignore")
 
 def main():
@@ -376,7 +380,8 @@ def main():
     ## generate asice file
     print("Allkirjasta valik PIN2 abil")
     asic_file = generate_asice_file(asice_path=fn_root+".asice", 
-                                    ballot_path=fn_root+".ballot")
+                                    ballot_path=fn_root+".ballot",
+                                    ivxv_collect=args.collector)
     
     ## get asice file
     with open(fn_root+".asice", "rb") as f:
